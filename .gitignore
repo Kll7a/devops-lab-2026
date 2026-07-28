@@ -1,0 +1,13 @@
+# секреты и локальное состояние — в Git не попадают никогда
+*.key
+*.pem
+age.key
+.env
+kubeconfig
+*.retry
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+# Bruno: локальные окружения с реальными паролями
+api-tests/bruno/environments/local-*.bru
