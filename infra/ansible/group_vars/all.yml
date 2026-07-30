@@ -1,0 +1,25 @@
+---
+# Единая точка правды по версиям. Меняем версию — меняем одну строку.
+k3s_channel: "v1.35"            # канал k3s; фиксируем минор ради воспроизводимости
+k3s_disable: []                  # что отключить у k3s (traefik оставляем — нужен ingress)
+lab_user: "lab"
+
+# CIDR-ы k3s по умолчанию: нужны для правил firewalld
+k3s_pod_cidr: "10.42.0.0/16"
+k3s_svc_cidr: "10.43.0.0/16"
+
+base_packages:
+  - git
+  - jq
+  - make
+  - curl
+  - tar
+  - bash-completion
+  - python3-pip
+  - policycoreutils-python-utils   # semanage, пригодится при работе с SELinux
+
+container_packages:
+  - podman
+  - buildah
+  - skopeo
+  - podman-compose

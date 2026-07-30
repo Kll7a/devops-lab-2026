@@ -1,0 +1,189 @@
+---
+- name: Подготовка лабораторного хоста (AlmaLinux 10)
+  hosts: lab
+  become: true
+
+  tasks:
+    # ---------- Базовые пакеты и пользователи ----------
+    - name: Включить репозиторий EPEL
+      ansible.builtin.dnf:
+        name: epel-release
+        state: present
+      tags: [base]
+
+    - name: Установить базовые утилиты
+      ansible.builtin.dnf:
+        name: "{{ base_packages }}"
+        state: present
+      tags: [base]
+
+    - name: Создать пользователя {{ lab_user }}
+      ansible.builtin.user:
+        name: "{{ lab_user }}"
+        state: present
+        shell: /bin/bash
+        create_home: true
+      tags: [base, containers]
+
+    # ---------- Контейнеры ----------
+    - name: Установить Podman и инструменты сборки
+      ansible.builtin.dnf:
+        name: "{{ container_packages }}"
+        state: present
+      tags: [containers]
+
+    - name: Разрешить пользовательским сервисам работать без активной сессии
+      ansible.builtin.command: "loginctl enable-linger {{ lab_user }}"
+      args:
+        creates: "/var/lib/systemd/linger/{{ lab_user }}"
+      tags: [containers]
+
+    - name: Диапазоны subuid/subgid для rootless-контейнеров
+      ansible.builtin.command: "usermod --add-subuids 200000-265535 --add-subgids 200000-265535 {{ lab_user }}"
+      register: subid
+      changed_when: subid.rc == 0
+      failed_when: subid.rc != 0 and 'already' not in subid.stderr
+      tags: [containers]
+
+    # ---------- Подготовка ядра под Kubernetes ----------
+    - name: Установить дополнительные модули ядра (содержит br_netfilter)
+      ansible.builtin.dnf:
+        name: "kernel-modules-extra-{{ ansible_kernel }}"
+        state: present
+      tags: [k3s]
+
+    - name: Настроить автозагрузку модулей ядра
+      ansible.builtin.copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
+      tags: [k3s]
+
+    - name: Загрузить модули ядра в текущую сессию
+      ansible.builtin.command: "modprobe {{ item }}"
+      changed_when: false
+      loop:
+        - overlay
+        - br_netfilter
+      tags: [k3s]
+
+    - name: Отключить swap в текущей сессии
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      tags: [k3s]
+
+    - name: Убрать swap из /etc/fstab (чтобы не вернулся после перезагрузки)
+      ansible.posix.mount:
+        path: swap
+        fstype: swap
+        state: absent
+      tags: [k3s]
+
+    - name: Параметры ядра для сети контейнеров
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/99-k8s.conf
+        reload: true
+      loop:
+        - { name: net.ipv4.ip_forward, value: "1" }
+        - { name: net.bridge.bridge-nf-call-iptables, value: "1" }
+        - { name: fs.inotify.max_user_instances, value: "1024" }
+        - { name: fs.inotify.max_user_watches, value: "524288" }
+      tags: [k3s]
+
+    # ---------- Firewalld ----------
+    - name: Открыть порты, нужные k3s
+      ansible.posix.firewalld:
+        port: "{{ item }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - "6443/tcp"     # Kubernetes API
+        - "10250/tcp"    # kubelet (metrics-server, kubectl logs/exec)
+        - "8472/udp"     # flannel VXLAN — сеть между подами
+        - "80/tcp"       # Traefik ingress
+        - "443/tcp"
+      tags: [firewall]
+
+    - name: Доверять трафику из сетей подов и сервисов
+      ansible.posix.firewalld:
+        source: "{{ item }}"
+        zone: trusted
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - "{{ k3s_pod_cidr }}"
+        - "{{ k3s_svc_cidr }}"
+      tags: [firewall]
+
+    # ---------- k3s ----------
+    - name: Скачать официальный установщик k3s
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /usr/local/bin/k3s-install.sh
+        mode: "0755"
+      tags: [k3s]
+
+    - name: Установить k3s (идемпотентно — повторный запуск ничего не ломает)
+      ansible.builtin.command: /usr/local/bin/k3s-install.sh
+      environment:
+        INSTALL_K3S_CHANNEL: "{{ k3s_channel }}"
+        INSTALL_K3S_EXEC: >-
+          server
+          --write-kubeconfig-mode=0644
+          --node-name=lab-node
+          --tls-san={{ ansible_default_ipv4.address }}
+      args:
+        creates: /usr/local/bin/k3s
+      tags: [k3s]
+
+    - name: Дождаться готовности API-сервера
+      ansible.builtin.wait_for:
+        port: 6443
+        delay: 3
+        timeout: 180
+      tags: [k3s]
+
+    - name: Положить kubeconfig пользователю
+      block:
+        - ansible.builtin.file:
+            path: "/home/{{ lab_user }}/.kube"
+            state: directory
+            owner: "{{ lab_user }}"
+            mode: "0700"
+        - ansible.builtin.copy:
+            src: /etc/rancher/k3s/k3s.yaml
+            dest: "/home/{{ lab_user }}/.kube/config"
+            remote_src: true
+            owner: "{{ lab_user }}"
+            mode: "0600"
+      tags: [k3s]
+
+    # ---------- CLI-инструменты ----------
+    - name: Установить kubectl
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/{{ lookup('url', 'https://dl.k8s.io/release/stable.txt') | trim }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: "0755"
+      tags: [tools]
+
+    - name: Установить Helm
+      ansible.builtin.shell: |
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+      environment:
+        PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+      tags: [tools]
+
+    - name: Установить uv (менеджер зависимостей Python)
+      ansible.builtin.shell: |
+        curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+      args:
+        creates: /usr/local/bin/uv
+      tags: [tools]
