@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+FROM docker.io/library/python:3.13-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Слой зависимостей отдельно от кода: правка main.py не пересобирает pip install
+COPY requirements.txt ./
+RUN pip install -r requirements.txt \
+ && opentelemetry-bootstrap -a install
+
+COPY src/ ./src/
+
+# Непривилегированный пользователь: контейнер не должен работать от root
+RUN useradd --uid 10001 --create-home appuser && chown -R appuser /app
+USER 10001
+
+EXPOSE 8000
+
+# opentelemetry-instrument оборачивает процесс и включает авто-инструментацию
+CMD ["opentelemetry-instrument", "uvicorn", "src.main:app", \
+     "--host", "0.0.0.0", "--port", "8000"]

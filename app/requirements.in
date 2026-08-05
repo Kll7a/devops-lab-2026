@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+asyncpg
+redis
+aio-pika
+pydantic
+opentelemetry-distro
+opentelemetry-exporter-otlp
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-asyncpg
+opentelemetry-instrumentation-redis
+opentelemetry-instrumentation-aio-pika
