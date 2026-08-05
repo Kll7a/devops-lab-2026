@@ -10,3 +10,18 @@ host: ## Привести VM к состоянию из Ansible
 
 verify: ## Проверить стенд
 	./scripts/verify.sh
+
+up: ## Поднять локальный стенд
+	cd app && podman-compose up -d --build
+
+down: ## Погасить локальный стенд (данные сохраняются)
+	cd app && podman-compose down
+
+clean: ## Погасить и удалить данные
+	cd app && podman-compose down -v
+
+spec: ## Обновить app/openapi.json из работающего API
+	curl -sS localhost:8000/openapi.json | jq -S . > app/openapi.json
+
+api-test: ## Прогнать коллекцию Bruno
+	cd api-tests/bruno && bru run --env local
