@@ -1,0 +1,111 @@
+name: demo-lab
+
+services:
+  postgres:
+    # 16-alpine — версия, на которой стенд уже поднимался healthy.
+    # НЕ меняйте на 18-alpine: в 18-й официальный образ сменил layout данных
+    # (PGDATA стал /var/lib/postgresql/18/docker, VOLUME переехал
+    # на /var/lib/postgresql, а /var/lib/postgresql/data стал симлинком).
+    # Заодно это ближе к манифестам Kubernetes на дне 4, где почти везде
+    # по умолчанию монтируется /var/lib/postgresql/data.
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo          # локально не секрет; в кластере — Sealed Secret
+      POSTGRES_DB: demo
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  valkey:
+    image: docker.io/valkey/valkey:8-alpine
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: docker.io/library/rabbitmq:4-management
+    # Имя Erlang-узла складывается из hostname. Без этой строки узел зовётся
+    # rabbit@localhost и теряет каталог mnesia при пересоздании контейнера.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: demo
+      RABBITMQ_DEFAULT_PASS: demo
+      # Cookie передаётся аргументом: Erlang идёт в ветку init_setcookie
+      # и к $HOME/.erlang.cookie не обращается вообще. Это лечение eacces.
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-setcookie demolabcookie"
+      # Обязательно и для CLI: иначе healthcheck под root создаёт
+      # .erlang.cookie с режимом 400, и сервер под uid 999 его не прочитает.
+      RABBITMQ_CTL_ERL_ARGS: "-setcookie demolabcookie"
+    volumes:
+      # Явный named volume вместо анонимного из VOLUME в Dockerfile:
+      # его видно в podman volume ls и он удаляется через down -v.
+      - rabbitmq-data:/var/lib/rabbitmq:z
+    ports:
+      - "15672:15672"        # веб-интерфейс: http://localhost:15672
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  otel-collector:
+    # Версия зафиксирована вместо latest — тот же принцип воспроизводимости,
+    # что и для requirements.txt.
+    image: docker.io/otel/opentelemetry-collector-contrib:0.157.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:z
+    ports:
+      - "8889:8889"          # метрики в формате Prometheus для локальной проверки
+
+  api:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: localhost/demo-api:dev
+    environment: &app_env
+      PG_URI: postgresql://demo:demo@postgres:5432/demo
+      REDIS_URL: redis://valkey:6379/0
+      AMQP_URL: amqp://demo:demo@rabbitmq:5672/
+      OTEL_SERVICE_NAME: demo-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_METRIC_EXPORT_INTERVAL: "10000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      valkey:   { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+
+  worker:
+    # Блок build продублирован намеренно: без него podman-compose пытается
+    # СКАЧАТЬ localhost/demo-api:dev из реестра и падает. Слои кэшированы
+    # после сборки api, вторая сборка занимает секунды.
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: localhost/demo-api:dev
+    command: ["opentelemetry-instrument", "python", "-m", "src.worker"]
+    environment:
+      <<: *app_env
+      OTEL_SERVICE_NAME: demo-worker
+    depends_on:
+      postgres: { condition: service_healthy }
+      valkey:   { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  rabbitmq-data:
