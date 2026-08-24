@@ -7,7 +7,8 @@ python - <<'PY' > /tmp/openapi-generated.json
 import json, sys
 sys.path.insert(0, "app")
 from src.main import app
-json.dump(app.openapi(), sys.stdout, indent=2, sort_keys=True)
+json.dump(app.openapi(), sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
+print()
 PY
 
 if ! diff -u app/openapi.json /tmp/openapi-generated.json; then
