@@ -53,6 +53,7 @@ jobs:
         run: uv run bash ../scripts/check-openapi-drift.sh
 
       - name: Линт OpenAPI-спецификации
+        working-directory: app
         run: npx --yes @redocly/cli@latest lint app/openapi.json --format=stylish
 
   # --------------------------------------------------------------- contract
