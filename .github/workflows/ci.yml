@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['gitops/**', 'docs/**', '**.md']
+  pull_request:
+    paths-ignore: ['gitops/**', 'docs/**', '**.md']
+
+# Не собираем одновременно два коммита одной ветки: новый пуш отменяет старый прогон
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# По умолчанию у токена нет никаких прав — выдаём точечно в каждом job
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/demo-api
+
+jobs:
+  # ---------------------------------------------------------------- quality
+  quality:
+    name: Линт, тесты, схема
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Поставить зависимости
+        working-directory: app
+        run: |
+          uv venv
+          uv pip install -r requirements.txt
+          uv pip install ruff pytest
+
+      - name: ruff
+        working-directory: app
+        run: uv run ruff check src tests
+
+      - name: pytest
+        working-directory: app
+        run: uv run pytest -q
+
+      - name: Схема OpenAPI не разошлась с кодом
+        working-directory: app
+        run: uv run bash ../scripts/check-openapi-drift.sh
+
+      - name: Линт OpenAPI-спецификации
+        run: npx --yes @redocly/cli@latest lint app/openapi.json --format=stylish
+
+  # --------------------------------------------------------------- contract
+  contract:
+    name: Контрактные тесты API
+    runs-on: ubuntu-24.04
+    needs: quality
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: demo
+          POSTGRES_PASSWORD: demo
+          POSTGRES_DB: demo
+        options: >-
+          --health-cmd "pg_isready -U demo" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+        ports: ['5432:5432']
+      valkey:
+        image: valkey/valkey:8-alpine
+        options: >-
+          --health-cmd "valkey-cli ping" --health-interval 5s --health-retries 10
+        ports: ['6379:6379']
+      rabbitmq:
+        image: rabbitmq:4-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: demo
+          RABBITMQ_DEFAULT_PASS: demo
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_running"
+          --health-interval 10s --health-retries 12
+        ports: ['5672:5672']
+    env:
+      PG_URI: postgresql://demo:demo@localhost:5432/demo
+      REDIS_URL: redis://localhost:6379/0
+      AMQP_URL: amqp://demo:demo@localhost:5672/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Запустить API в фоне
+        working-directory: app
+        run: |
+          uv venv && uv pip install -r requirements.txt
+          uv run uvicorn src.main:app --host 127.0.0.1 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -sf localhost:8000/readyz && break || sleep 2
+          done
+
+      - name: Schemathesis — тесты, сгенерированные из схемы
+        working-directory: app
+        run: |
+          uv pip install schemathesis
+          uv run schemathesis run http://127.0.0.1:8000/openapi.json \
+            --checks all --max-examples 30 --exclude-path /readyz
+
+      - name: Bruno CLI — сценарные проверки
+        run: |
+          npm install -g @usebruno/cli
+          cd api-tests/bruno && bru run --env ci
+
+  # ------------------------------------------------------------------ build
+  build:
+    name: Сборка и публикация образа
+    runs-on: ubuntu-24.04
+    needs: contract
+    if: github.event_name == 'push'      # PR-ы проверяем, но образы публикуем только из main
+    permissions:
+      contents: read
+      packages: write                     # право писать в GHCR
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Собрать образ (Buildah)
+        id: build
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: ${{ env.IMAGE_NAME }}
+          tags: ${{ github.sha }} latest
+          containerfiles: ./app/Containerfile
+          context: ./app
+          oci: true
+
+      - name: Логин в GHCR
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ env.IMAGE_NAME }}
+          tags: ${{ github.sha }} latest
+          registry: ${{ env.REGISTRY }}
+
+  # ----------------------------------------------------------------- supply
+  supply-chain:
+    name: Уязвимости, SBOM, подпись
+    runs-on: ubuntu-24.04
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+      id-token: write        # OIDC-токен для keyless-подписи cosign
+      security-events: write # загрузка отчёта в Security tab
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy — сканирование образа
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Отчёт в Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+      - name: SBOM (Syft, формат SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: spdx-json
+          artifact-name: sbom.spdx.json
+
+      - name: Установить cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Подписать образ (keyless)
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+        env:
+          COSIGN_EXPERIMENTAL: "1"
