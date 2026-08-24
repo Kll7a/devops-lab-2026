@@ -54,7 +54,7 @@ jobs:
 
       - name: Линт OpenAPI-спецификации
         working-directory: app
-        run: npx --yes @redocly/cli@latest lint app/openapi.json --format=stylish
+        run: npx --yes @redocly/cli@latest lint openapi.json --format=stylish
 
   # --------------------------------------------------------------- contract
   contract:
