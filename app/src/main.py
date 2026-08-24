@@ -11,11 +11,15 @@ from pydantic import BaseModel, Field
 
 from .telemetry import cache_lookups, orders_created
 
-PG_URI = os.environ["PG_URI"]
+# Читаем переменные окружения на уровне модуля через os.getenv (не os.environ[...]!).
+# Это НЕ падает, если переменной нет — значение будет None.
+# Важно: импорт этого модуля (тестами, линтерами, скриптом проверки OpenAPI-схемы)
+# не должен требовать наличия боевых подключений к БД/очереди.
+PG_URI = os.getenv("PG_URI")
 REDIS_URL = os.getenv("REDIS_URL", "redis://valkey:6379/0")
-AMQP_URL = os.environ["AMQP_URL"]
-QUEUE = "orders"
+AMQP_URL = os.getenv("AMQP_URL")
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "60"))
+QUEUE = "orders"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -42,6 +46,20 @@ class Order(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # А вот здесь приложение РЕАЛЬНО стартует и обязано подключаться к внешним
+    # сервисам — поэтому именно тут, а не при импорте, мы проверяем обязательность
+    # переменных и явно объясняем, чего не хватает.
+    if not PG_URI:
+        raise RuntimeError(
+            "Переменная окружения PG_URI обязательна для запуска приложения "
+            "(например: postgresql://demo:demo@localhost:5432/demo)"
+        )
+    if not AMQP_URL:
+        raise RuntimeError(
+            "Переменная окружения AMQP_URL обязательна для запуска приложения "
+            "(например: amqp://demo:demo@localhost:5672/)"
+        )
+
     # Соединения открываем один раз при старте, а не на каждый запрос.
     app.state.pg = await asyncpg.create_pool(PG_URI, min_size=1, max_size=8)
     async with app.state.pg.acquire() as conn:
@@ -54,7 +72,7 @@ async def lifespan(app: FastAPI):
     await channel.declare_queue(QUEUE, durable=True)
     app.state.channel = channel
 
-    yield  # <-- здесь приложение работает
+    yield  # <-- здесь приложение работает и обслуживает запросы
 
     await app.state.amqp.close()
     await app.state.redis.aclose()
@@ -71,11 +89,15 @@ app = FastAPI(
 
 @app.get("/healthz", tags=["ops"], summary="Живость процесса")
 async def healthz():
+    # Liveness: НЕ ходит в БД/очередь. Если тут будет ошибка — Kubernetes
+    # начнёт бесконечно перезапускать здоровый процесс из-за чужой проблемы.
     return {"status": "ok"}
 
 
 @app.get("/readyz", tags=["ops"], summary="Готовность к трафику")
 async def readyz():
+    # Readiness: наоборот, обязан проверять реальные зависимости — если БД
+    # недоступна, под должны временно убрать из балансировки.
     try:
         async with app.state.pg.acquire() as conn:
             await conn.fetchval("SELECT 1")

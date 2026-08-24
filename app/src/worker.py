@@ -9,14 +9,28 @@ import redis.asyncio as redis
 
 from .telemetry import orders_processed
 
-PG_URI = os.environ["PG_URI"]
+# Как и в main.py: os.getenv (не os.environ[...]) — импорт модуля не должен
+# требовать боевых подключений. Обязательность проверяем только внутри main(),
+# то есть в момент реального запуска воркера.
+PG_URI = os.getenv("PG_URI")
 REDIS_URL = os.getenv("REDIS_URL", "redis://valkey:6379/0")
-AMQP_URL = os.environ["AMQP_URL"]
+AMQP_URL = os.getenv("AMQP_URL")
 QUEUE = "orders"
 WORK_SECONDS = float(os.getenv("WORK_SECONDS", "0.4"))
 
 
 async def main() -> None:
+    if not PG_URI:
+        raise RuntimeError(
+            "Переменная окружения PG_URI обязательна для запуска воркера "
+            "(например: postgresql://demo:demo@localhost:5432/demo)"
+        )
+    if not AMQP_URL:
+        raise RuntimeError(
+            "Переменная окружения AMQP_URL обязательна для запуска воркера "
+            "(например: amqp://demo:demo@localhost:5672/)"
+        )
+
     pool = await asyncpg.create_pool(PG_URI, min_size=1, max_size=4)
     cache = redis.from_url(REDIS_URL, decode_responses=True)
     connection = await aio_pika.connect_robust(AMQP_URL)

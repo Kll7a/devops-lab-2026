@@ -1,5 +1,4 @@
-from fastapi.testclient import TestClient
-import app.src.main as m
+import src.main as m
 
 
 def test_openapi_schema_is_valid():

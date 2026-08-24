@@ -25,3 +25,12 @@ spec: ## Обновить app/openapi.json из работающего API
 
 api-test: ## Прогнать коллекцию Bruno
 	cd api-tests/bruno && bru run --env local
+
+dev-setup: ## Установить окружение для разработки (один раз)
+	cd app && uv venv && uv pip install -r requirements.txt && uv pip install ruff pytest
+
+lint: ## Проверить стиль кода
+	cd app && uv run ruff check src tests --fix
+
+test: ## Прогнать юнит-тесты
+	cd app && uv run pytest -q
